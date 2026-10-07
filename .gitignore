@@ -45,3 +45,6 @@ Thumbs.db
 
 # Local secrets
 .env
+
+# Ignore reports directory to prevent committing large files
+reports/

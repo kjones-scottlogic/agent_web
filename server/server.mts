@@ -12,9 +12,9 @@ import type { ResearchOutput } from './models/research-output.ts';
 import type { CoverageReport } from './models/coverage-report.ts';
 
 const PORT = Number(process.env['PORT'] ?? 3000);
-//const MODEL = 'claude-opus-5-5';
-const MODEL = 'claude-haiku-4-5';
-const MAX_TOKENS = 1024;
+const RESEARCH_MODEL = 'claude-haiku-4-5';
+const CONSOLIDATION_MODEL = 'claude-sonnet-5-5';
+const MAX_TOKENS = 4000;
 const COVERAGE_THRESHOLD = 0.9;
 const MAX_REFINEMENT_ITERATIONS = 3;
 
@@ -53,35 +53,6 @@ const docAnalysisAgent: AgentDefinition = {
   tools: ['Read', 'Grep'],
 };
 
-// Builds the synthesis subagent with the findings gathered from the web-search and doc-analysis subagents.
-function createSynthesisAgent(outputs: ResearchOutput[]): AgentDefinition {
-  const findings = outputs.flatMap((output) => output.findings);
-  const findingsBy = (agent: string) =>
-    JSON.stringify(
-      findings.filter((finding) => finding.retrieved_by === agent),
-      null,
-      2,
-    );
-
-  return {
-    description: 'Synthesises findings from other subagents into a report',
-    prompt: `
-      Synthesise the following research findings into a coherent report.
-      Every claim MUST include a citation with source URL and page number.
-
-      <web-search-findings>
-      ${findingsBy('web-search')}
-      </web-search-findings>
-      <doc-analysis-findings>
-      ${findingsBy('doc-analysis')}
-      </doc-analysis-findings>
-
-      Output a report where every factual claim links to its source.
-    `,
-    tools: [],
-  };
-}
-
 // A finding as a subagent reports it; retrieved_by is filled in from the subagent's name.
 const SubagentFinding = z.object({
   claim: z.string(),
@@ -109,48 +80,44 @@ function parseFindings(report: string, retrievedBy: string): Finding[] {
   });
 }
 
-// Runs a comprehensive query that researches subtopics via parallel agents and synthesizes findings in a single query call.
-async function runComprehensiveQuery(
-  topic: string,
-  subtopics: string[],
-): Promise<{ outputs: ResearchOutput[]; report: string; summary: string }> {
+// Runs research for a single subtopic with parallel research agents and synthesis, all in one query.
+async function runSubtopicQueryWithParallelAgents(
+  subtopic: string,
+  onProgress?: ProgressCallback,
+  originalSubtopics?: string[],
+  allOutputs?: ResearchOutput[],
+): Promise<ResearchOutput[]> {
   const outputs: ResearchOutput[] = [];
-  let report = '';
-  let summary = '';
+  let synthesisReport = '';
 
-  const subtopicsStr = subtopics.join(', ');
+  const synthesisAgent: AgentDefinition = {
+    description: `Synthesise research findings for "${subtopic}"`,
+    prompt: `
+      Synthesise the research findings for "${subtopic}" into a coherent, fully-cited report.
+      Every claim MUST include a citation with source URL and page number.
+    `,
+    tools: [],
+  };
 
   const queryResponse = query({
     prompt: `
-      Produce a comprehensive research report on: ${topic}
+      Research "${subtopic}" thoroughly. Invoke the web-search and doc-analysis subagents in parallel — emit both Agent tool calls in a single response.
+      After both subagents return their findings, invoke the synthesis subagent to produce a synthesised report.
 
-      Research the following subtopics: ${subtopicsStr}
+      - web-search subagent: Search the web for current information about "${subtopic}".
+      - doc-analysis subagent: Analyse documents in ./docs for information about "${subtopic}".
+      - synthesis subagent: After gathering findings, synthesise them into a report with citations.
 
-      For EACH subtopic:
-      1. Invoke the doc-analysis and web-search subagents in parallel — emit both Agent tool calls in a single response
-      2. doc-analysis: analyse documents in ./docs for information about the subtopic
-      3. web-search: search the web for current information about the subtopic
-
-      After gathering all findings across all subtopics, invoke the synthesis subagent to produce a comprehensive, fully-cited report synthesizing all findings.
-
-      Do not use the general-purpose agent.
+      Do not do any research yourself; delegate all work to the subagents.
     `,
     options: {
-      model: MODEL,
+      model: RESEARCH_MODEL,
       allowedTools: ['Agent', 'WebSearch', 'Read', 'Grep'],
       thinking: { budgetTokens: MAX_TOKENS, type: 'enabled' },
       agents: {
         'web-search': webSearchAgent,
         'doc-analysis': docAnalysisAgent,
-        synthesis: {
-          description: 'Synthesises research findings into a comprehensive report',
-          prompt: `
-            Synthesise all gathered research findings into a comprehensive, coherent report.
-            Every factual claim MUST include a citation with source URL and page number.
-            Organize findings by subtopic when appropriate. Produce a well-structured report.
-          `,
-          tools: [],
-        },
+        synthesis: synthesisAgent,
       },
       hooks: {
         SubagentStop: [
@@ -159,26 +126,15 @@ async function runComprehensiveQuery(
               async (input) => {
                 if (input.hook_event_name === 'SubagentStop') {
                   if (input.agent_type === 'synthesis') {
-                    // The synthesis agent's output is the full report.
-                    report = input.last_assistant_message ?? '';
-                    console.log(`[${topic}] synthesis: report generated`);
+                    synthesisReport = input.last_assistant_message ?? '';
+                    console.log(`[${subtopic}] synthesis: report generated`);
                   } else {
-                    // Research agents return findings.
                     const findings = parseFindings(
                       input.last_assistant_message ?? '',
                       input.agent_type,
                     );
-                    console.log(`[${topic}] ${input.agent_type}: ${findings.length} findings`);
-                    const matchingSubtopic = subtopics.find(
-                      (st) =>
-                        input.last_assistant_message?.toLowerCase().includes(st.toLowerCase()) ||
-                        st.toLowerCase().includes(input.agent_type),
-                    );
-                    outputs.push({
-                      findings,
-                      query: matchingSubtopic || topic,
-                      timestamp: new Date().toISOString(),
-                    });
+                    console.log(`[${subtopic}] ${input.agent_type}: ${findings.length} findings`);
+                    outputs.push({ findings, query: subtopic, timestamp: new Date().toISOString() });
                   }
                 }
                 return {};
@@ -190,65 +146,63 @@ async function runComprehensiveQuery(
     },
   });
 
-  // Process all messages; both research and synthesis happen within this single query call.
-  for await (const message of queryResponse) {
-    if (message.type === 'result' && message.subtype === 'success') {
-      // The coordinator's final reply may contain the summary paragraph.
-      summary = message.result;
-    }
+  for await (const _message of queryResponse) {
+    // SDK executes research agents in parallel, then synthesis — all within one query.
   }
 
-  return { outputs, report, summary };
+  if (originalSubtopics && allOutputs) {
+    allOutputs.push(...outputs);
+    const covered = originalSubtopics.filter((st) =>
+      allOutputs.some((output) => output.query === st && output.findings.length > 0),
+    );
+    const percentage = Math.round((covered.length / originalSubtopics.length) * 60) + 10;
+    onProgress?.({ type: 'status', percentage, message: `Completed: ${subtopic}` });
+  }
+
+  return outputs;
 }
 
-// Has the coordinator send the gathered findings to the synthesis subagent for a full report,
-// then summarise that report in one paragraph.
-async function synthesiseReport(
+// Runs research queries for subtopics in parallel (each with research and synthesis in the same query).
+async function runComprehensiveQuery(
   topic: string,
-  outputs: ResearchOutput[],
-): Promise<{ report: string; summary: string }> {
-  let report = '';
-  let summary = '';
+  subtopics: string[],
+  onProgress?: ProgressCallback,
+  originalSubtopics?: string[],
+  accumulatedOutputs?: ResearchOutput[],
+): Promise<{ outputs: ResearchOutput[]; report: string; summary: string }> {
+  // Use accumulated outputs from previous iterations, or start fresh
+  const allOutputs = accumulatedOutputs ?? [];
+  const originals = originalSubtopics ?? subtopics;
 
-  const queryResponse = query({
-    prompt: `
-      The synthesis subagent has already been given all of the research findings for ${topic}.
-      Call the synthesis subagent now to produce the full report. Do not ask any questions and do not do any research yourself.
-      When it returns the report, reply with a single paragraph summarising the report.
-    `,
-    options: {
-      model: MODEL,
-      allowedTools: ['Agent'],
-      thinking: { budgetTokens: MAX_TOKENS, type: 'enabled' },
-      agents: {
-        synthesis: createSynthesisAgent(outputs),
-      },
-      hooks: {
-        // The synthesis subagent's last message is the full report.
-        SubagentStop: [
-          {
-            hooks: [
-              async (input) => {
-                if (input.hook_event_name === 'SubagentStop' && input.agent_type === 'synthesis') {
-                  report = input.last_assistant_message ?? '';
-                }
-                return {};
-              },
-            ],
-          },
-        ],
-      },
-    },
-  });
+  // Research all subtopics in parallel (each query includes web-search, doc-analysis, and synthesis)
+  const outputs = (
+    await Promise.all(
+      subtopics.map(async (subtopic) => {
+        try {
+          return await runSubtopicQueryWithParallelAgents(subtopic, onProgress, originals, allOutputs);
+        } catch (err) {
+          console.error(`[${subtopic}] query failed:`, err);
+          return [];
+        }
+      }),
+    )
+  ).flat();
 
-  for await (const message of queryResponse) {
-    // The coordinator's final reply is the one-paragraph summary.
-    if (message.type === 'result' && message.subtype === 'success') {
-      summary = message.result;
+  const findings = outputs.flatMap((output) => output.findings);
+
+  const formatFinding = (f: Finding) => {
+    if (f.retrieved_by === 'doc-analysis') {
+      const pageRef = f.page_number ? `, page ${f.page_number}` : '';
+      return `- ${f.claim} (${f.document_name}${pageRef})`;
+    } else {
+      return `- ${f.claim} (${f.source_url})`;
     }
-  }
+  };
 
-  return { report, summary };
+  const report = `Research findings for: ${topic}\n\n${findings.map(formatFinding).join('\n')}`;
+  const summary = `Completed research on ${topic} across ${subtopics.length} subtopic(s).`;
+
+  return { outputs, report, summary };
 }
 
 // Evaluates coverage completeness across all subtopics.
@@ -284,16 +238,28 @@ async function writeReport(topic: string, report: string): Promise<void> {
   console.log(`Report written to ${filePath}`);
 }
 
-async function chat(body: ChatRequest): Promise<ChatResponse> {
+interface ProgressUpdate {
+  type: 'status' | 'summary' | 'file';
+  percentage: number;
+  message?: string;
+  fileName?: string;
+}
+
+type ProgressCallback = (update: ProgressUpdate) => void;
+
+async function chat(body: ChatRequest, onProgress: ProgressCallback): Promise<ChatResponse> {
   const response = await client.beta.messages.parse({
-    model: MODEL,
+    model: RESEARCH_MODEL,
     max_tokens: MAX_TOKENS,
     messages: [
       {
         role: 'user',
         content: `
-          List ALL major subtopics for: ${body.topic}.
-          Ensure comprehensive breadth — missing an entire category is a critical failure.
+          Identify all distinct categories and types that make up: ${body.topic}.
+          Break down the topic into high-level subtopics representing the main categories or types.
+          For example, for "renewable energy," subtopics would be: solar, wind, hydroelectric, geothermal, biomass, tidal, energy storage — not cross-cutting aspects.
+          Each subtopic will be researched comprehensively, including its environmental impact, economics, policy, and innovation.
+          Ensure no major category or type is missing.
           Return as JSON array.
         `,
       },
@@ -312,6 +278,8 @@ async function chat(body: ChatRequest): Promise<ChatResponse> {
 
   const { subtopics } = response.parsed_output;
 
+  onProgress({ type: 'status', percentage: 10, message: `Starting research on ${subtopics.length} subtopics` });
+
   let allOutputs: ResearchOutput[] = [];
   let coverage: CoverageReport = { covered: [], gaps: subtopics, completeness: 0 };
   let iterations = 0;
@@ -320,10 +288,17 @@ async function chat(body: ChatRequest): Promise<ChatResponse> {
 
   while (coverage.completeness < COVERAGE_THRESHOLD && iterations < MAX_REFINEMENT_ITERATIONS) {
     const subtopicsToQuery = iterations === 0 ? subtopics : coverage.gaps;
+    const iterationProgress = 10 + (iterations / MAX_REFINEMENT_ITERATIONS) * 60;
+
     console.log(`[Iteration ${iterations + 1}] Researching and synthesizing ${subtopicsToQuery.length} subtopic(s)`);
+    onProgress({
+      type: 'status',
+      percentage: Math.round(iterationProgress),
+      message: `Researching ${subtopicsToQuery.length} subtopic${subtopicsToQuery.length === 1 ? '' : 's'}:\n${subtopicsToQuery.map((s) => `- ${s}`).join('\n')}`,
+    });
 
     try {
-      const { outputs, report, summary } = await runComprehensiveQuery(body.topic, subtopicsToQuery);
+      const { outputs, report, summary } = await runComprehensiveQuery(body.topic, subtopicsToQuery, onProgress, subtopics, allOutputs);
       allOutputs.push(...outputs);
       finalReport = report;
       finalSummary = summary;
@@ -345,7 +320,47 @@ async function chat(body: ChatRequest): Promise<ChatResponse> {
     );
   }
 
+  onProgress({ type: 'status', percentage: 75, message: 'Consolidating findings...' });
+
+  // Perform final consolidation using Sonnet
+  const allFindings = allOutputs.flatMap((output) => output.findings);
+  const findingsJson = JSON.stringify(allFindings, null, 2);
+
+  const consolidationPrompt = `
+    Consolidate the following research findings into a comprehensive, well-organized report on ${body.topic}.
+    Every factual claim MUST include proper citations with source information.
+    Organize by subtopic when appropriate. Produce a coherent, professional report.
+
+    <findings>
+    ${findingsJson}
+    </findings>
+  `;
+
+  const sonnetResponse = await client.messages.create({
+    model: CONSOLIDATION_MODEL,
+    max_tokens: MAX_TOKENS,
+    messages: [
+      {
+        role: 'user',
+        content: consolidationPrompt,
+      },
+    ],
+  });
+
+  finalReport = sonnetResponse.content[0].type === 'text' ? sonnetResponse.content[0].text : finalReport;
+  finalSummary = finalReport.split('\n').slice(0, 3).join(' ').substring(0, 200);
+
+  const slug = body.topic
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '');
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const fileName = `reports/${slug}-${timestamp}.md`;
+
   await writeReport(body.topic, finalReport);
+
+  onProgress({ type: 'summary', percentage: 90, message: finalSummary });
+  onProgress({ type: 'file', percentage: 100, fileName });
 
   const subtopicList = subtopics.map((topic, i) => `${i + 1}. ${topic}`).join('\n');
   const text = `Subtopics:\n${subtopicList}\n\nSummary:\n${finalSummary}`;
@@ -393,21 +408,37 @@ createServer(async (req, res) => {
   }
 
   try {
-    send(res, 200, await chat(body));
+    // Send as Server-Sent Events stream
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      Connection: 'keep-alive',
+    });
+
+    const onProgress = (update: ProgressUpdate) => {
+      res.write(`data: ${JSON.stringify(update)}\n\n`);
+    };
+
+    const result = await chat(body, onProgress);
+
+    // Send final result
+    res.write(`data: ${JSON.stringify({ type: 'complete', percentage: 100, result })}\n\n`);
+    res.end();
   } catch (error) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
     if (error instanceof RefusalError) {
-      send(res, 422, { error: error.message });
+      res.end(JSON.stringify({ error: error.message }));
     } else if (error instanceof Anthropic.AuthenticationError) {
       console.error('Authentication failed - is ANTHROPIC_API_KEY set?');
-      send(res, 502, { error: 'The server could not authenticate with the Anthropic API.' });
+      res.end(JSON.stringify({ error: 'The server could not authenticate with the Anthropic API.' }));
     } else if (error instanceof Anthropic.RateLimitError) {
-      send(res, 429, { error: 'Rate limited by the Anthropic API - please try again shortly.' });
+      res.end(JSON.stringify({ error: 'Rate limited by the Anthropic API - please try again shortly.' }));
     } else if (error instanceof Anthropic.APIError) {
       console.error(`Anthropic API error ${error.status}:`, error.message);
-      send(res, 502, { error: `Anthropic API error (${error.status ?? 'network'}).` });
+      res.end(JSON.stringify({ error: `Anthropic API error (${error.status ?? 'network'}).` }));
     } else {
       console.error(error);
-      send(res, 500, { error: 'Unexpected server error.' });
+      res.end(JSON.stringify({ error: 'Unexpected server error.' }));
     }
   }
 }).listen(PORT, () => {

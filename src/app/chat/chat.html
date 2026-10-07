@@ -1,5 +1,12 @@
 <app-chat-history [messages]="messages()" />
 
+<div *ngIf="pending()" class="progress-container">
+  <div class="progress-bar">
+    <div class="progress-fill" [style.width.%]="progress()"></div>
+  </div>
+  <span class="progress-text">{{ progress() }}%</span>
+</div>
+
 <form class="composer" (ngSubmit)="send()">
   <input
     type="text"
@@ -8,6 +15,7 @@
     autocomplete="off"
     name="draft"
     [(ngModel)]="draft"
+    [disabled]="pending()"
   />
-  <button type="submit" [disabled]="!draft().trim() || pending()">Send</button>
+  <button type="submit" [disabled]="!draft().trim() || pending()">{{ pending() ? 'Researching...' : 'Send' }}</button>
 </form>
