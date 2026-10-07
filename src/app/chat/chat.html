@@ -1,0 +1,13 @@
+<app-chat-history [messages]="messages()" />
+
+<form class="composer" (ngSubmit)="send()">
+  <input
+    type="text"
+    placeholder="Enter a research topic"
+    aria-label="Message"
+    autocomplete="off"
+    name="draft"
+    [(ngModel)]="draft"
+  />
+  <button type="submit" [disabled]="!draft().trim() || pending()">Send</button>
+</form>

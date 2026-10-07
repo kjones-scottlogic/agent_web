@@ -1,0 +1,5 @@
+@for (message of messages(); track $index) {
+  <div class="message" [class]="message.role">{{ message.text }}</div>
+} @empty {
+  <p class="empty">No messages yet. Say hello!</p>
+}
