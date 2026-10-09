@@ -120,6 +120,18 @@ async function runSubtopicQueryWithParallelAgents(
         synthesis: synthesisAgent,
       },
       hooks: {
+        SubagentStart: [
+          {
+            hooks: [
+              async (input) => {
+                if (input.hook_event_name === 'SubagentStart') {
+                  console.log(`[${subtopic}] ${input.agent_type}: started`);
+                }
+                return {};
+              },
+            ],
+          },
+        ],
         SubagentStop: [
           {
             hooks: [
@@ -134,7 +146,11 @@ async function runSubtopicQueryWithParallelAgents(
                       input.agent_type,
                     );
                     console.log(`[${subtopic}] ${input.agent_type}: ${findings.length} findings`);
-                    outputs.push({ findings, query: subtopic, timestamp: new Date().toISOString() });
+                    outputs.push({
+                      findings,
+                      query: subtopic,
+                      timestamp: new Date().toISOString(),
+                    });
                   }
                 }
                 return {};
@@ -179,7 +195,12 @@ async function runComprehensiveQuery(
     await Promise.all(
       subtopics.map(async (subtopic) => {
         try {
-          return await runSubtopicQueryWithParallelAgents(subtopic, onProgress, originals, allOutputs);
+          return await runSubtopicQueryWithParallelAgents(
+            subtopic,
+            onProgress,
+            originals,
+            allOutputs,
+          );
         } catch (err) {
           console.error(`[${subtopic}] query failed:`, err);
           return [];
@@ -278,7 +299,11 @@ async function chat(body: ChatRequest, onProgress: ProgressCallback): Promise<Ch
 
   const { subtopics } = response.parsed_output;
 
-  onProgress({ type: 'status', percentage: 10, message: `Starting research on ${subtopics.length} subtopics` });
+  onProgress({
+    type: 'status',
+    percentage: 10,
+    message: `Starting research on ${subtopics.length} subtopics`,
+  });
 
   let allOutputs: ResearchOutput[] = [];
   let coverage: CoverageReport = { covered: [], gaps: subtopics, completeness: 0 };
@@ -290,7 +315,9 @@ async function chat(body: ChatRequest, onProgress: ProgressCallback): Promise<Ch
     const subtopicsToQuery = iterations === 0 ? subtopics : coverage.gaps;
     const iterationProgress = 10 + (iterations / MAX_REFINEMENT_ITERATIONS) * 60;
 
-    console.log(`[Iteration ${iterations + 1}] Researching and synthesizing ${subtopicsToQuery.length} subtopic(s)`);
+    console.log(
+      `[Iteration ${iterations + 1}] Researching and synthesizing ${subtopicsToQuery.length} subtopic(s)`,
+    );
     onProgress({
       type: 'status',
       percentage: Math.round(iterationProgress),
@@ -298,7 +325,13 @@ async function chat(body: ChatRequest, onProgress: ProgressCallback): Promise<Ch
     });
 
     try {
-      const { outputs, report, summary } = await runComprehensiveQuery(body.topic, subtopicsToQuery, onProgress, subtopics, allOutputs);
+      const { outputs, report, summary } = await runComprehensiveQuery(
+        body.topic,
+        subtopicsToQuery,
+        onProgress,
+        subtopics,
+        allOutputs,
+      );
       allOutputs.push(...outputs);
       finalReport = report;
       finalSummary = summary;
@@ -347,7 +380,8 @@ async function chat(body: ChatRequest, onProgress: ProgressCallback): Promise<Ch
     ],
   });
 
-  finalReport = sonnetResponse.content[0].type === 'text' ? sonnetResponse.content[0].text : finalReport;
+  finalReport =
+    sonnetResponse.content[0].type === 'text' ? sonnetResponse.content[0].text : finalReport;
   finalSummary = finalReport.split('\n').slice(0, 3).join(' ').substring(0, 200);
 
   const slug = body.topic
@@ -430,9 +464,13 @@ createServer(async (req, res) => {
       res.end(JSON.stringify({ error: error.message }));
     } else if (error instanceof Anthropic.AuthenticationError) {
       console.error('Authentication failed - is ANTHROPIC_API_KEY set?');
-      res.end(JSON.stringify({ error: 'The server could not authenticate with the Anthropic API.' }));
+      res.end(
+        JSON.stringify({ error: 'The server could not authenticate with the Anthropic API.' }),
+      );
     } else if (error instanceof Anthropic.RateLimitError) {
-      res.end(JSON.stringify({ error: 'Rate limited by the Anthropic API - please try again shortly.' }));
+      res.end(
+        JSON.stringify({ error: 'Rate limited by the Anthropic API - please try again shortly.' }),
+      );
     } else if (error instanceof Anthropic.APIError) {
       console.error(`Anthropic API error ${error.status}:`, error.message);
       res.end(JSON.stringify({ error: `Anthropic API error (${error.status ?? 'network'}).` }));
